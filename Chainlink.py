@@ -1,4 +1,3 @@
-# bot.py
 import os
 import asyncio
 import logging
@@ -9,7 +8,7 @@ import discord
 
 # ---------- Config ----------
 TOKEN = os.environ.get("TOKEN")
-GUILD_ID_RAW = os.environ.get("GUILD_ID")  # optional; if unset, update all guilds
+GUILD_ID_RAW = os.environ.get("GUILD_ID")  # optional; if unset, updates all guilds
 COIN = "chainlink"  # LINK on CoinGecko
 INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "60"))
 
@@ -24,16 +23,13 @@ if GUILD_ID_RAW:
         raise SystemExit("GUILD_ID must be an integer if provided")
 
 # ---------- Logging ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("link-bot")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("link-price-bot")
 
 # ---------- Discord client ----------
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # enable "Server Members Intent" in Dev Portal
+intents.members = True  # also enable "Server Members Intent" in the Dev Portal
 client = discord.Client(intents=intents)
 
 _http_session: Optional[aiohttp.ClientSession] = None
@@ -42,8 +38,12 @@ update_task: Optional[asyncio.Task] = None
 
 # ---------- HTTP helpers ----------
 async def get_price_data(session: aiohttp.ClientSession) -> Tuple[float, float]:
+    """
+    Fetch LINK USD price and 24h % change from CoinGecko with light retries.
+    Returns: (price_usd, change_24h_percent)
+    """
     url = f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids={COIN}"
-    backoffs = [0, 1.5, 3.0, 5.0]
+    backoffs = [0, 1.5, 3.0, 5.0]  # seconds
 
     for attempt, delay in enumerate(backoffs, start=1):
         if delay:
@@ -54,7 +54,7 @@ async def get_price_data(session: aiohttp.ClientSession) -> Tuple[float, float]:
                 if resp.status == 200:
                     data = await resp.json()
                     if not isinstance(data, list) or not data:
-                        raise RuntimeError("CoinGecko returned empty/invalid")
+                        raise RuntimeError("CoinGecko returned empty/invalid payload")
                     row = data[0]
                     price = float(row["current_price"])
                     change = float(row["price_change_percentage_24h"])
@@ -67,7 +67,7 @@ async def get_price_data(session: aiohttp.ClientSession) -> Tuple[float, float]:
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             log.warning(f"HTTP error (attempt {attempt}): {e}")
 
-    raise RuntimeError("Failed to fetch price after retries")
+    raise RuntimeError("Failed to fetch LINK price after retries")
 
 
 # ---------- Per-guild update ----------
@@ -95,6 +95,8 @@ async def update_guild(guild: discord.Guild):
         return
 
     emoji = "🟢" if change_24h >= 0 else "🔴"
+
+    # Nickname exactly like the screenshot: "$3.25 🟢"
     nickname = f"${price:.2f} {emoji}"
     if len(nickname) > 32:
         nickname = nickname[:32]
@@ -106,6 +108,7 @@ async def update_guild(guild: discord.Guild):
     except discord.HTTPException as e:
         log.warning(f"[{guild.name}] HTTP error updating nick: {e}")
 
+    # Presence under the name: "24h change +52.04%"
     try:
         await client.change_presence(activity=discord.Game(name=f"24h change {change_24h:+.2f}%"))
     except Exception as e:
@@ -141,17 +144,15 @@ async def updater_loop():
 # ---------- Events ----------
 @client.event
 async def on_ready():
-    global update_task, _http_session
+    global _http_session, update_task
     log.info(f"Logged in as {client.user} in {len(client.guilds)} guild(s).")
+
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession()
+
     if update_task is None or update_task.done():
         update_task = asyncio.create_task(updater_loop())
 
-@client.event
-async def on_error(event, *args, **kwargs):
-    # catch-all to surface exceptions in Railway logs
-    log.exception(f"Unhandled error in event '{event}'")
 
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
