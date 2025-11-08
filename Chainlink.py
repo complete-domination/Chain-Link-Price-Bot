@@ -1,132 +1,108 @@
-import os
-import asyncio
-import logging
-from typing import Tuple, Optional
-
-import aiohttp
 import discord
+import aiohttp
+import asyncio
+import os
 
-# ---------- Config ----------
-TOKEN = os.environ.get("TOKEN")
-GUILD_ID_RAW = os.environ.get("GUILD_ID")  # optional; if unset, updates all guilds
-COIN = "chainlink"  # LINK on CoinGecko
-INTERVAL_SECONDS = int(os.environ.get("INTERVAL_SECONDS", "60"))
+# Environment variables
+TOKEN = os.environ.get('TOKEN')
+GUILD_ID = os.environ.get('GUILD_ID')  # optional
+COIN = "chainlink"  # ✅ use the correct CoinGecko ID for Chainlink (LINK)
 
 if not TOKEN:
     raise SystemExit("Missing env var TOKEN")
-
-GUILD_ID: Optional[int] = None
-if GUILD_ID_RAW:
+if GUILD_ID:
     try:
-        GUILD_ID = int(GUILD_ID_RAW)
+        GUILD_ID = int(GUILD_ID)
     except ValueError:
-        raise SystemExit("GUILD_ID must be an integer if provided")
+        raise SystemExit("GUILD_ID must be an integer")
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("link-price-bot")
-
-# ---------- Discord client ----------
+# Discord intents
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # enable "Server Members Intent" in Dev Portal
+intents.members = True  # also enable "Server Members Intent" in Dev Portal
 client = discord.Client(intents=intents)
 
-_http_session: Optional[aiohttp.ClientSession] = None
-update_task: Optional[asyncio.Task] = None
+update_task = None
 
-# ---------- HTTP ----------
-async def get_price_data(session: aiohttp.ClientSession) -> Tuple[float, float]:
+# --- Price fetcher ---
+async def get_price_data():
     url = f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids={COIN}"
-    backoffs = [0, 1.5, 3.0, 5.0]
-    for attempt, delay in enumerate(backoffs, start=1):
-        if delay:
-            await asyncio.sleep(delay)
-        try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with session.get(url, timeout=timeout) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if not isinstance(data, list) or not data:
-                        raise RuntimeError("CoinGecko returned empty/invalid payload")
-                    row = data[0]
-                    return float(row["current_price"]), float(row["price_change_percentage_24h"])
-                elif resp.status in (429, 500, 502, 503, 504):
-                    log.warning(f"CoinGecko {resp.status} (attempt {attempt})")
-                else:
-                    raise RuntimeError(f"CoinGecko HTTP {resp.status}")
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            log.warning(f"HTTP error (attempt {attempt}): {e}")
-    raise RuntimeError("Failed to fetch LINK price after retries")
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"CoinGecko HTTP {resp.status}")
+            data = await resp.json()
+            price = data[0]['current_price']
+            change_24h = data[0]['price_change_percentage_24h']
+            return price, change_24h
 
-# ---------- Per-guild update ----------
+# --- Per-guild update ---
 async def update_guild(guild: discord.Guild):
     try:
         me = guild.me or await guild.fetch_member(client.user.id)
     except discord.HTTPException as e:
-        log.warning(f"[{guild.name}] fetch_member failed: {e}")
+        print(f"[{guild.name}] Could not fetch bot member: {e}")
         return
 
     perms = me.guild_permissions
-    if not (perms.change_nickname or perms.manage_nicknames):
-        log.info(f"[{guild.name}] Missing permission: Change Nickname (or Manage Nicknames).")
+    if not perms.change_nickname and not perms.manage_nicknames:
+        print(f"[{guild.name}] Missing permission: Change Nickname or Manage Nicknames.")
         return
 
     try:
-        price, change_24h = await get_price_data(_http_session)
+        price, change_24h = await get_price_data()
     except Exception as e:
-        log.warning(f"[{guild.name}] Price fetch failed: {e}")
-        try:
-            await client.change_presence(activity=discord.Game(name="price: API error"))
-        except Exception:
-            pass
+        print(f"[{guild.name}] Price fetch failed: {e}")
         return
 
     emoji = "🟢" if change_24h >= 0 else "🔴"
+
+    # Nickname shows only price + emoji
     nickname = f"${price:.2f} {emoji}"
     if len(nickname) > 32:
         nickname = nickname[:32]
 
     try:
         await me.edit(nick=nickname, reason="Auto price update")
-    except discord.Forbidden:
-        log.info(f"[{guild.name}] Forbidden: role hierarchy/permissions block nickname change.")
-    except discord.HTTPException as e:
-        log.warning(f"[{guild.name}] HTTP error updating nick: {e}")
-
-    try:
         await client.change_presence(activity=discord.Game(name=f"24h change {change_24h:+.2f}%"))
-    except Exception as e:
-        log.debug(f"[{guild.name}] presence set failed: {e}")
+        print(f"[{guild.name}] Nick → {nickname}, 24h change {change_24h:+.2f}%")
+    except discord.Forbidden:
+        print(f"[{guild.name}] Forbidden: role hierarchy or permissions issue.")
+    except discord.HTTPException as e:
+        print(f"[{guild.name}] HTTP error updating nickname: {e}")
 
-    log.info(f"[{guild.name}] Nick → {nickname} | 24h → {change_24h:+.2f}%")
-
-# ---------- Loop ----------
+# --- Main loop ---
 async def updater_loop():
     await client.wait_until_ready()
-    log.info("Updater loop started.")
     while not client.is_closed():
         try:
-            targets = [client.get_guild(GUILD_ID)] if GUILD_ID else list(client.guilds)
-            targets = [g for g in targets if g]
-            if not targets:
-                log.info("No guilds to update yet.")
+            target_guilds = []
+            if GUILD_ID:
+                g = client.get_guild(GUILD_ID)
+                if g:
+                    target_guilds = [g]
+                else:
+                    print("Configured GUILD_ID not found.")
             else:
-                await asyncio.gather(*(update_guild(g) for g in targets))
-        except Exception as e:
-            log.error(f"Updater loop error: {e}")
-        await asyncio.sleep(INTERVAL_SECONDS)
+                target_guilds = list(client.guilds)
 
-# ---------- Events ----------
+            if not target_guilds:
+                print("No guilds found.")
+            else:
+                await asyncio.gather(*(update_guild(g) for g in target_guilds))
+        except Exception as e:
+            print(f"Updater loop error: {e}")
+
+        await asyncio.sleep(60)  # update interval
+
+# --- Startup ---
 @client.event
 async def on_ready():
-    global _http_session, update_task
-    log.info(f"Logged in as {client.user} in {len(client.guilds)} guild(s).")
-    if not _http_session or _http_session.closed:
-        _http_session = aiohttp.ClientSession()
-    if not update_task or update_task.done():
+    global update_task
+    print(f"Logged in as {client.user} in {len(client.guilds)} guild(s).")
+    if update_task is None or update_task.done():
         update_task = asyncio.create_task(updater_loop())
 
-# ---------- Run ----------
 if __name__ == "__main__":
     client.run(TOKEN)
